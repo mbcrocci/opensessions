@@ -451,9 +451,15 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[]): v
   // --- Sidebar resize enforcement ---
 
   function resizeSidebars() {
-    // Only broadcast target width — each TUI handles its own pane resize via SIGWINCH
-    log("resize", "broadcasting", { sidebarWidth });
-    server.publish("sidebar", JSON.stringify({ type: "resize", width: sidebarWidth }));
+    // Enforce sidebar width on all panes (after terminal resize, etc.)
+    const p = getProviderWithSidebar();
+    if (p) {
+      const panes = p.listSidebarPanes();
+      log("resize", "enforcing width on all panes", { sidebarWidth, count: panes.length });
+      for (const pane of panes) {
+        p.resizeSidebarPane(pane.paneId, sidebarWidth);
+      }
+    }
   }
 
   function handleCommand(cmd: ClientCommand, ws: any) {
@@ -508,26 +514,9 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[]): v
         saveConfig({ theme: cmd.theme });
         broadcastState();
         break;
-      case "report-width": {
-        // Reject absurd values (min 10, max 80)
-        if (cmd.width < 10 || cmd.width > 80) {
-          log("report-width", "REJECTED — out of bounds", { width: cmd.width });
-          break;
-        }
-        log("report-width", "accepted", { width: cmd.width, prev: sidebarWidth });
-        sidebarWidth = cmd.width;
-        saveConfig({ sidebarWidth: cmd.width });
-        // Broadcast to all OTHER TUIs (the sender already has the correct width)
-        const p2 = getProviderWithSidebar();
-        if (p2) {
-          const panes = p2.listSidebarPanes();
-          for (const pane of panes) {
-            p2.resizeSidebarPane(pane.paneId, sidebarWidth);
-          }
-        }
-        server.publish("sidebar", JSON.stringify({ type: "resize", width: sidebarWidth }));
+      case "report-width":
+        // No-op: sidebar width is config-only, not auto-saved from drag
         break;
-      }
       case "quit":
         quitAll();
         break;

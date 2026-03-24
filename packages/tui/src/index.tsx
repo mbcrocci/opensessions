@@ -49,8 +49,6 @@ function App() {
 
   const clientTty = getClientTty();
   let ws: WebSocket | null = null;
-  // Shared mutable ref for sidebar width — updated by both state messages and resize messages
-  let sidebarWidthRef = 26;
 
   function send(cmd: ClientCommand) {
     if (connected() && ws) ws.send(JSON.stringify(cmd));
@@ -118,8 +116,6 @@ function App() {
             setFocusedSession(msg.focusedSession);
             setCurrentSession(msg.currentSession);
             setTheme(resolveTheme(msg.theme));
-            // Sync sidebar width so SIGWINCH handler knows the real server width
-            if (msg.sidebarWidth) sidebarWidthRef = msg.sidebarWidth;
           } else if (msg.type === "focus") {
             setFocusedSession(msg.focusedSession);
             setCurrentSession(msg.currentSession);
@@ -135,56 +131,11 @@ function App() {
 
     onCleanup(() => socket.close());
 
-    // --- Flag-based SIGWINCH handler ---
-    // Two scenarios:
-    // 1. Client resize: server sends {type:"resize", width} → set pendingClientResize=true
-    //    On SIGWINCH → snap to server width, clear flag
-    // 2. Manual resize: SIGWINCH without pending flag → debounce 100ms, read pane width, report to server
-    const paneIdForResize = process.env.TMUX_PANE;
-    let pendingClientResize = false;
-    let snapCooldown = false;
-    let resizeDebounce: ReturnType<typeof setTimeout> | null = null;
-
-    if (paneIdForResize) {
-      const onSigwinch = () => {
-        if (pendingClientResize) {
-          // Client resize — snap back to server width
-          pendingClientResize = false;
-          snapCooldown = true;
-          sdk.resizePane(paneIdForResize, { width: sidebarWidthRef });
-          // The resize-pane we just did will trigger another SIGWINCH — ignore it
-          setTimeout(() => { snapCooldown = false; }, 300);
-        } else if (snapCooldown) {
-          // Ignore — this SIGWINCH was caused by our own snap-back
-        } else {
-          // Possible manual resize — debounce and report
-          if (resizeDebounce) clearTimeout(resizeDebounce);
-          resizeDebounce = setTimeout(() => {
-            resizeDebounce = null;
-            const widthStr = sdk.display("#{pane_width}", { target: paneIdForResize });
-            const newWidth = parseInt(widthStr, 10);
-            if (!isNaN(newWidth) && newWidth > 0 && newWidth !== sidebarWidthRef) {
-              send({ type: "report-width", width: newWidth });
-            }
-          }, 200);
-        }
-      };
-      process.on("SIGWINCH", onSigwinch);
-      onCleanup(() => {
-        process.off("SIGWINCH", onSigwinch);
-        if (resizeDebounce) clearTimeout(resizeDebounce);
-      });
-    }
-
-    // Listen for resize and quit messages from server
+    // Listen for quit messages from server
     socket.addEventListener("message", (event) => {
       try {
         const msg = JSON.parse(event.data as string);
-        if (msg.type === "resize" && typeof msg.width === "number") {
-          sidebarWidthRef = msg.width;
-          pendingClientResize = true;
-        } else if (msg.type === "quit") {
-          // Server told us to quit
+        if (msg.type === "quit") {
           if (ws) ws.close();
           renderer.destroy();
         }
