@@ -157,7 +157,9 @@ function readEventsFileFallback(tracker: AgentTracker): void {
 export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[]): void {
   const allProviders = [mux, ...(extraProviders ?? [])];
   const tracker = new AgentTracker();
-  const sessionOrder = new SessionOrder();
+  const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
+  const sessionOrderPath = join(home, ".config", "opensessions", "session-order.json");
+  const sessionOrder = new SessionOrder(sessionOrderPath);
 
   // Clear previous log on server start
   try { writeFileSync(DEBUG_LOG, ""); } catch {}

@@ -1,4 +1,7 @@
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect, afterEach } from "bun:test";
+import { existsSync, unlinkSync, mkdirSync, readFileSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
 import { SessionOrder } from "../src/server/session-order";
 
 describe("SessionOrder", () => {
@@ -57,5 +60,52 @@ describe("SessionOrder", () => {
     order.reorder("d", -1); // [a, b, d, c]
     order.reorder("d", -1); // [a, d, b, c]
     expect(order.apply(["a", "b", "c", "d"])).toEqual(["a", "d", "b", "c"]);
+  });
+});
+
+describe("SessionOrder persistence", () => {
+  const testDir = join(tmpdir(), "opensessions-test-" + process.pid);
+  const persistPath = join(testDir, "session-order.json");
+
+  afterEach(() => {
+    try { unlinkSync(persistPath); } catch {}
+  });
+
+  test("reorder persists to disk", () => {
+    mkdirSync(testDir, { recursive: true });
+    const order = new SessionOrder(persistPath);
+    order.sync(["a", "b", "c"]);
+    order.reorder("c", -1);
+
+    expect(existsSync(persistPath)).toBe(true);
+    const saved = JSON.parse(readFileSync(persistPath, "utf-8"));
+    expect(saved).toEqual(["a", "c", "b"]);
+  });
+
+  test("new instance loads persisted order", () => {
+    mkdirSync(testDir, { recursive: true });
+    const order1 = new SessionOrder(persistPath);
+    order1.sync(["a", "b", "c"]);
+    order1.reorder("c", -1); // [a, c, b]
+
+    const order2 = new SessionOrder(persistPath);
+    order2.sync(["a", "b", "c"]);
+    expect(order2.apply(["a", "b", "c"])).toEqual(["a", "c", "b"]);
+  });
+
+  test("no persist path means no file written", () => {
+    const order = new SessionOrder();
+    order.sync(["a", "b"]);
+    order.reorder("b", -1);
+    // No crash, no file — just works in-memory
+    expect(order.apply(["a", "b"])).toEqual(["b", "a"]);
+  });
+
+  test("corrupt file is ignored gracefully", () => {
+    mkdirSync(testDir, { recursive: true });
+    Bun.write(persistPath, "not valid json{{{");
+    const order = new SessionOrder(persistPath);
+    order.sync(["x", "y"]);
+    expect(order.apply(["x", "y"])).toEqual(["x", "y"]);
   });
 });
