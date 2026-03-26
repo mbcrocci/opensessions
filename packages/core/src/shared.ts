@@ -20,6 +20,8 @@ export interface SessionData {
   windows: number;
   uptime: string;
   agentState: AgentEvent | null;
+  agents: AgentEvent[];
+  eventTimestamps: number[];
 }
 
 export interface ServerState {

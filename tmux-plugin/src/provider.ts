@@ -157,7 +157,10 @@ export class TmuxProvider implements MuxProvider {
     }
 
     tmux.setPaneTitle(newPane.id, "opensessions");
-    tmux.selectPane(targetPane.id);
+    // Do NOT selectPane here for fresh spawns — the TUI's refocusMainPane()
+    // handles it after terminal capability detection finishes. Refocusing
+    // immediately causes capability query responses (DECRPM, DA1, Kitty
+    // graphics) to be routed to the main pane as garbage escape sequences.
     return newPane.id;
   }
 

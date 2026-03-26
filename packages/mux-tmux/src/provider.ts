@@ -44,14 +44,15 @@ export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapabl
   }
 
   listSessions(): MuxSessionInfo[] {
-    return tmux.listSessions()
-      .filter((s) => s.name !== STASH_SESSION)
-      .map((s) => ({
-        name: s.name,
-        createdAt: s.createdAt,
-        dir: s.dir,
-        windows: s.windowCount,
-      }));
+    const sessions = tmux.listSessions()
+      .filter((s) => s.name !== STASH_SESSION);
+    const activeDirs = tmux.getActiveSessionDirs();
+    return sessions.map((s) => ({
+      name: s.name,
+      createdAt: s.createdAt,
+      dir: activeDirs.get(s.name) ?? s.dir,
+      windows: s.windowCount,
+    }));
   }
 
   switchSession(name: string, clientTty?: string): void {
@@ -194,7 +195,10 @@ export class TmuxProvider implements MuxProviderV1, WindowCapable, SidebarCapabl
     }
 
     tmux.setPaneTitle(newPane.id, "opensessions");
-    tmux.selectPane(targetPane.id);
+    // Do NOT selectPane here for fresh spawns — the TUI's refocusMainPane()
+    // handles it after terminal capability detection finishes. Refocusing
+    // immediately causes capability query responses (DECRPM, DA1, Kitty
+    // graphics) to be routed to the main pane as garbage escape sequences.
     return newPane.id;
   }
 

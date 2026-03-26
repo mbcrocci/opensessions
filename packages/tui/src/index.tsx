@@ -43,6 +43,7 @@ const SPINNERS = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇",
 const UNSEEN_ICON = "●";
 const BOLD = TextAttributes.BOLD;
 const DIM = TextAttributes.DIM;
+const SPARK_BLOCKS = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 
 const THEME_NAMES = Object.keys(BUILTIN_THEMES);
 
@@ -356,30 +357,36 @@ function App() {
     sessions.filter((s) => s.agentState?.status === "running").length,
   );
 
+  const errorCount = createMemo(() =>
+    sessions.filter((s) => s.agentState?.status === "error").length,
+  );
+
   const unseenCount = createMemo(() =>
     sessions.filter((s) => s.unseen).length,
   );
 
   const isFocused = createSelector(focusedSession);
 
+  const focusedData = createMemo(() =>
+    sessions.find((s) => s.name === focusedSession()) ?? null,
+  );
+
   return (
     <box flexDirection="column" flexGrow={1} backgroundColor={P().crust}>
       {/* Header */}
-      <box flexDirection="column" paddingLeft={2} paddingTop={1} flexShrink={0}>
+      <box flexDirection="column" paddingLeft={1} paddingTop={1} paddingBottom={0} flexShrink={0}>
         <text>
-          <span style={{ fg: P().blue, attributes: BOLD }}>⚡ Sessions</span>
-          {"  "}
-          <span style={{ fg: runningCount() > 0 ? P().text : P().overlay0 }}>{String(sessions.length)}</span>
-          {runningCount() > 0 ? " " : ""}
-          {runningCount() > 0 ? <span style={{ fg: P().yellow }}>{"⚡"}{runningCount()}</span> : ""}
-          {unseenCount() > 0 ? " " : ""}
-          {unseenCount() > 0 ? <span style={{ fg: P().teal }}>{"●"}{unseenCount()}</span> : ""}
+          <span style={{ fg: P().overlay1 }}>{"  "}</span>
+          <span style={{ fg: P().subtext0, attributes: BOLD }}>Sessions</span>
+          <span style={{ fg: P().overlay0 }}>{" "}{String(sessions.length)}</span>
+          {runningCount() > 0 ? <span style={{ fg: P().yellow }}>{" "}{"⚡"}{runningCount()}</span> : ""}
+          {errorCount() > 0 ? <span style={{ fg: P().red }}>{" "}{"✗"}{errorCount()}</span> : ""}
+          {unseenCount() > 0 ? <span style={{ fg: P().teal }}>{" "}{"●"}{unseenCount()}</span> : ""}
         </text>
-        <text style={{ fg: P().surface2 }}>{"─".repeat(22)}</text>
       </box>
 
       {/* Session list */}
-      <scrollbox flexGrow={1}>
+      <scrollbox flexGrow={1} paddingTop={1}>
         <For each={sessions}>
           {(session, i) => (
             <SessionCard
@@ -400,29 +407,23 @@ function App() {
         </For>
       </scrollbox>
 
+      {/* Detail panel — focused session info */}
+      <Show when={focusedData()}>
+        {(data) => (
+          <DetailPanel session={data()} theme={theme} statusColors={S} spinIdx={spinIdx} />
+        )}
+      </Show>
+
       {/* Footer */}
-      <box flexDirection="column" paddingLeft={2} paddingBottom={1} flexShrink={0}>
-        <text style={{ fg: P().surface2 }}>{"─".repeat(22)}</text>
+      <box flexDirection="column" paddingLeft={1} paddingBottom={1} paddingTop={0} flexShrink={0}>
+        <text style={{ fg: P().surface2 }}>{"─".repeat(26)}</text>
         <text>
-          <span style={{ fg: P().overlay0, attributes: DIM }}>⇥</span>
-          {" "}
-          <span style={{ fg: P().overlay1 }}>cycle</span>
-          {"  "}
-          <span style={{ fg: P().overlay0, attributes: DIM }}>1-9</span>
-          {" "}
-          <span style={{ fg: P().overlay1 }}>jump</span>
-          {"  "}
-          <span style={{ fg: P().overlay0, attributes: DIM }}>⏎</span>
-          {" "}
-          <span style={{ fg: P().overlay1 }}>go</span>
-          {"  "}
-          <span style={{ fg: P().overlay0, attributes: DIM }}>t</span>
-          {" "}
-          <span style={{ fg: P().overlay1 }}>theme</span>
-          {"  "}
-          <span style={{ fg: P().overlay0, attributes: DIM }}>q</span>
-          {" "}
-          <span style={{ fg: P().overlay1 }}>quit</span>
+          <span style={{ fg: P().overlay0 }}>{"  ⇥"}</span>
+          <span style={{ fg: P().overlay1 }}>{" cycle  "}</span>
+          <span style={{ fg: P().overlay0 }}>{"⏎"}</span>
+          <span style={{ fg: P().overlay1 }}>{" go  "}</span>
+          <span style={{ fg: P().overlay0 }}>{"t"}</span>
+          <span style={{ fg: P().overlay1 }}>{" theme"}</span>
         </text>
       </box>
 
@@ -528,6 +529,100 @@ function ThemePicker(props: ThemePickerProps) {
   );
 }
 
+// --- Sparkline ---
+
+function buildSparkline(timestamps: number[], width: number, windowMs: number = 30 * 60 * 1000): string {
+  if (timestamps.length === 0 || width <= 0) return "";
+  const now = Date.now();
+  const start = now - windowMs;
+  const bucketSize = windowMs / width;
+  const buckets = new Array(width).fill(0);
+
+  for (const ts of timestamps) {
+    if (ts < start) continue;
+    const idx = Math.min(width - 1, Math.floor((ts - start) / bucketSize));
+    buckets[idx]++;
+  }
+
+  // Skip if too few buckets have data (would look like random floating blocks)
+  const activeBuckets = buckets.filter((c: number) => c > 0).length;
+  if (activeBuckets < 3) return "";
+
+  const max = Math.max(...buckets, 1);
+  return buckets.map((count: number) => {
+    if (count === 0) return "▁";
+    const level = Math.round((count / max) * (SPARK_BLOCKS.length - 1));
+    return SPARK_BLOCKS[Math.max(1, level)];
+  }).join("");
+}
+
+// --- Detail Panel ---
+
+interface DetailPanelProps {
+  session: SessionData;
+  theme: Accessor<Theme>;
+  statusColors: Accessor<Theme["status"]>;
+  spinIdx: Accessor<number>;
+}
+
+function DetailPanel(props: DetailPanelProps) {
+  const P = () => props.theme().palette;
+  const SC = () => props.statusColors();
+
+  const agents = () => props.session.agents ?? [];
+  const hasAgents = () => agents().length > 0;
+
+  const truncDir = () => {
+    const d = props.session.dir;
+    if (!d) return "";
+    const home = process.env.HOME ?? "";
+    const short = home && d.startsWith(home) ? "~" + d.slice(home.length) : d;
+    return short.length > 22 ? "…" + short.slice(short.length - 21) : short;
+  };
+
+  const truncThread = (name?: string) => {
+    if (!name) return "";
+    return name.length > 16 ? name.slice(0, 15) + "…" : name;
+  };
+
+  return (
+    <box flexDirection="column" flexShrink={0} paddingLeft={1}>
+      <text style={{ fg: P().surface2 }}>{"─".repeat(26)}</text>
+
+      {/* Directory */}
+      <text truncate>
+        <span style={{ fg: P().overlay0, attributes: DIM }}>{"  "}{truncDir()}</span>
+      </text>
+
+      {/* Agent instances — one per line, compact */}
+      <Show when={hasAgents()}>
+        <For each={agents()}>
+          {(agent) => {
+            const icon = () => {
+              if (agent.status === "running") return SPINNERS[props.spinIdx() % SPINNERS.length]!;
+              if (agent.status === "error") return "✗";
+              if (agent.status === "done") return "✓";
+              if (agent.status === "interrupted") return "⚠";
+              if (agent.status === "waiting") return "◉";
+              return "○";
+            };
+            const color = () => SC()[agent.status];
+            return (
+              <text truncate>
+                <span style={{ fg: color() }}>{"  "}{icon()}</span>
+                <span style={{ fg: P().overlay0 }}>{" "}{agent.agent}</span>
+                {agent.threadName
+                  ? <span style={{ fg: P().subtext0, attributes: DIM }}>{" "}{truncThread(agent.threadName)}</span>
+                  : ""}
+              </text>
+            );
+          }}
+        </For>
+      </Show>
+    </box>
+  );
+}
+
 // --- Session Card ---
 
 interface SessionCardProps {
@@ -554,10 +649,13 @@ function SessionCard(props: SessionCardProps) {
   const accentColor = () => {
     if (isUnseenTerminal()) return unseenAccentColor();
     const s = status();
+    if (s === "error") return P().red;
+    if (s === "interrupted") return P().peach;
     if (s === "running") return P().yellow;
+    if (s === "done") return P().green;
     if (props.isCurrent) return P().green;
-    if (props.isFocused) return P().blue;
-    return P().crust;
+    if (props.isFocused) return P().lavender;
+    return "transparent";
   };
 
   const unseenAccentColor = () => {
@@ -568,73 +666,89 @@ function SessionCard(props: SessionCardProps) {
   };
 
   const statusIcon = () => {
-    if (isUnseenTerminal()) return UNSEEN_ICON;
     const s = status();
     if (s === "running") return SPINNERS[props.spinIdx() % SPINNERS.length]!;
+    if (isUnseenTerminal()) return UNSEEN_ICON;
     return "";
   };
 
   const statusColor = () => {
     if (isUnseenTerminal()) return unseenAccentColor();
-    const s = status();
-    if (s === "running") return SC()[s];
-    return "";
+    return SC()[status()];
   };
 
-  const nameColor = () =>
-    props.isFocused ? P().text : props.isCurrent ? P().subtext1 : P().subtext0;
+  const nameColor = () => {
+    if (props.isFocused) return P().text;
+    if (props.isCurrent) return P().subtext1;
+    return P().subtext0;
+  };
+
+  const indexColor = () => {
+    if (props.isFocused) return P().subtext0;
+    return P().surface2;
+  };
 
   const truncName = () => {
     const n = props.session.name;
-    return n.length > 20 ? n.slice(0, 19) + "…" : n;
+    return n.length > 18 ? n.slice(0, 17) + "…" : n;
   };
 
   const truncBranch = () => {
     const b = props.session.branch;
     if (!b) return "";
-    return b.length > 17 ? b.slice(0, 16) + "…" : b;
+    return b.length > 15 ? b.slice(0, 14) + "…" : b;
+  };
+
+  const bgColor = () => {
+    if (props.isFocused) return P().surface0;
+    return "transparent";
   };
 
   return (
-    <box flexDirection="column">
+    <box flexDirection="column" flexShrink={0}>
       <box
         flexDirection="row"
-        flexShrink={0}
-        backgroundColor={props.isFocused ? P().surface0 : "transparent"}
-        paddingTop={1}
-        paddingBottom={1}
+        backgroundColor={bgColor()}
         onMouseDown={props.onSelect}
+        paddingLeft={1}
       >
-        {/* Left accent bar */}
-        <text style={{ fg: accentColor() }}>▎</text>
+        {/* Left accent — space-preserving, only colored for meaningful states */}
+        <text style={{ fg: accentColor() }}>{accentColor() === "transparent" ? " " : "▌"}</text>
 
-        {/* Index column */}
-        <box width={2} flexShrink={0}>
-          <text style={{ fg: props.isFocused ? P().overlay1 : P().surface2, attributes: DIM }}>{props.index}</text>
+        {/* Index */}
+        <box width={3} flexShrink={0}>
+          <text style={{ fg: indexColor() }}>{String(props.index).padStart(2)}</text>
         </box>
 
-        {/* Content column */}
+        {/* Content */}
         <box flexDirection="column" flexGrow={1} paddingRight={1}>
-          {/* Row 1: name + spinner */}
+          {/* Row 1: name + status */}
           <box flexDirection="row">
             <text truncate flexGrow={1}>
-              {props.isFocused || props.isCurrent
-                ? <span style={{ fg: nameColor(), attributes: BOLD }}>{truncName()}</span>
-                : <span style={{ fg: nameColor() }}>{truncName()}</span>}
+              <span style={{ fg: nameColor(), attributes: props.isFocused || props.isCurrent ? BOLD : undefined }}>
+                {truncName()}
+              </span>
             </text>
             <Show when={statusIcon()}>
-              <text flexShrink={0}><span style={{ fg: statusColor() }}>{statusIcon()}</span></text>
+              <text flexShrink={0}>
+                <span style={{ fg: statusColor() }}>{" "}{statusIcon()}</span>
+              </text>
             </Show>
           </box>
 
-          {/* Row 2: branch */}
+          {/* Row 2: branch (only if exists) */}
           <Show when={props.session.branch}>
             <text truncate>
-              <span style={{ fg: P().pink }}>{truncBranch()}</span>
+              <span style={{ fg: props.isFocused ? P().pink : P().overlay0 }}>
+                {truncBranch()}
+              </span>
             </text>
           </Show>
         </box>
       </box>
+
+      {/* Breathing room — 1 empty line between cards */}
+      <box height={1} />
     </box>
   );
 }

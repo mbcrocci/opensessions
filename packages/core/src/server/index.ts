@@ -272,6 +272,8 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[]): v
         windows,
         uptime,
         agentState: tracker.getState(name),
+        agents: tracker.getAgents(name),
+        eventTimestamps: tracker.getEventTimestamps(name),
       };
     });
 
@@ -287,6 +289,7 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[]): v
   function broadcastState() {
     readEventsFileFallback(tracker);
     tracker.pruneStuck(STUCK_RUNNING_TIMEOUT_MS);
+    tracker.pruneTerminal();
     lastState = computeState();
     syncGitWatchers(lastState.sessions, broadcastState);
     const msg = JSON.stringify(lastState);

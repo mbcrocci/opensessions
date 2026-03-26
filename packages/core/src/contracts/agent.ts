@@ -5,6 +5,8 @@ export interface AgentEvent {
   session: string;
   status: AgentStatus;
   ts: number;
+  threadId?: string;
+  threadName?: string;
 }
 
 export const TERMINAL_STATUSES = new Set<AgentStatus>(["done", "error", "interrupted"]);

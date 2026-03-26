@@ -175,7 +175,7 @@ const SESSION_SPEC: FieldSpec<SessionInfo> = {
   createdAt: ["session_created", int],
   attachedClients: ["session_attached", int],
   windowCount: ["session_windows", int],
-  dir: ["pane_current_path", str],
+  dir: ["session_path", str],
 };
 
 const WINDOW_SPEC: FieldSpec<WindowInfo> = {
@@ -430,6 +430,30 @@ export class TmuxClient {
   getPaneCount(target: string): number {
     const panes = this.listPanes({ scope: "session", target });
     return panes.length;
+  }
+
+  /**
+   * Get the active pane's cwd for every session in one `list-panes -a` call.
+   * Uses tmux's -f filter to get only non-sidebar panes in active windows.
+   * First hit per session wins (tmux lists active pane first).
+   */
+  getActiveSessionDirs(): Map<string, string> {
+    const dirs = new Map<string, string>();
+    const { stdout } = this.run([
+      "list-panes", "-a",
+      "-f", "#{&&:#{window_active},#{!=:#{pane_title},opensessions}}",
+      "-F", `#{session_name}${SEP}#{pane_current_path}`,
+    ]);
+    if (!stdout) return dirs;
+    for (const line of stdout.split("\n")) {
+      if (!line) continue;
+      const sep = line.indexOf(SEP);
+      if (sep < 0) continue;
+      const session = line.slice(0, sep);
+      const cwd = line.slice(sep + 1);
+      if (!dirs.has(session)) dirs.set(session, cwd);
+    }
+    return dirs;
   }
 
   /**
