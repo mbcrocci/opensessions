@@ -1,7 +1,7 @@
 {
   "name": "opensessions",
   "private": true,
-  "workspaces": ["packages/*", "tmux-plugin", "integrations/zellij"],
+  "workspaces": ["packages/*", "tmux-plugin"],
   "scripts": {
     "build": "turbo build",
     "test": "turbo test",
