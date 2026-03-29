@@ -556,9 +556,6 @@ function App() {
       case "escape":
         if (panelFocus() === "agents") {
           setPanelFocus("sessions");
-        } else {
-          if (ws) ws.close();
-          renderer.destroy();
         }
         break;
       case "up":
@@ -698,7 +695,7 @@ function App() {
               session={session}
               index={i() + 1}
               isFocused={isFocused(session.name)}
-              isCurrent={session.name === mySession()}
+              isCurrent={session.name === currentSession()}
               spinIdx={spinIdx}
               theme={theme}
               statusColors={S}
@@ -711,6 +708,52 @@ function App() {
           )}
         </For>
       </scrollbox>
+
+      {/* Listening ports for focused session — above detail panel */}
+      <Show when={focusedData()?.ports?.length}>
+        {(_) => {
+          const portRows = () => {
+            const ports = focusedData()?.ports ?? [];
+            const maxPerRow = 3;
+            const rows: number[][] = [];
+            for (let i = 0; i < ports.length; i += maxPerRow) {
+              rows.push(ports.slice(i, i + maxPerRow));
+            }
+            return rows;
+          };
+          return (
+            <box flexDirection="column" flexShrink={0} paddingLeft={2}>
+              <For each={portRows()}>
+                {(ports, rowIndex) => (
+                  <box flexDirection="row" paddingRight={1}>
+                    <text flexShrink={0}>
+                      <span style={{ fg: rowIndex() === 0 ? P().overlay0 : P().surface2, attributes: DIM }}>
+                        {rowIndex() === 0 ? "local " : "      "}
+                      </span>
+                    </text>
+                    <For each={ports}>
+                      {(port, portIndex) => (
+                        <box flexDirection="row" flexShrink={0}>
+                          <text onMouseDown={() => {
+                            Bun.spawn(["open", `http://localhost:${port}`], { stdout: "ignore", stderr: "ignore" });
+                          }}>
+                            <span style={{ fg: P().sky, attributes: BOLD }}>{String(port)}</span>
+                          </text>
+                          <Show when={portIndex() < ports.length - 1}>
+                            <text>
+                              <span style={{ fg: P().surface2 }}>{" · "}</span>
+                            </text>
+                          </Show>
+                        </box>
+                      )}
+                    </For>
+                  </box>
+                )}
+              </For>
+            </box>
+          );
+        }}
+      </Show>
 
       {/* Detail panel — focused session info, draggable height */}
       <Show when={focusedData()}>
@@ -754,7 +797,7 @@ function App() {
 
       {/* Footer */}
       <box flexDirection="column" paddingLeft={1} paddingBottom={1} paddingTop={0} flexShrink={0}>
-        <text style={{ fg: P().surface2 }}>{"─".repeat(26)}</text>
+        <box height={1}><text style={{ fg: P().surface2 }}>{"─".repeat(200)}</text></box>
         <Show when={panelFocus() === "sessions"} fallback={
           <text>
             <span style={{ fg: P().overlay0 }}>{"←"}</span>
@@ -932,7 +975,7 @@ function ThemePicker(props: ThemePickerProps) {
         <text>
           <span style={{ fg: props.palette().blue, attributes: BOLD }}>Select Theme</span>
         </text>
-        <text style={{ fg: props.palette().surface2 }}>{"─".repeat(26)}</text>
+        <box height={1}><text style={{ fg: props.palette().surface2 }}>{"─".repeat(200)}</text></box>
         <box border borderColor={props.palette().surface1} marginBottom={1}>
           <input
             ref={(r: InputRenderable) => { inputRef = r; inputRef.focus(); }}
@@ -973,7 +1016,7 @@ function ThemePicker(props: ThemePickerProps) {
             </text>
           </Show>
         </Show>
-        <text style={{ fg: props.palette().surface2 }}>{"─".repeat(26)}</text>
+        <box height={1}><text style={{ fg: props.palette().surface2 }}>{"─".repeat(200)}</text></box>
         <text style={{ fg: props.palette().overlay0 }}>
           <span style={{ attributes: DIM }}>↑↓</span>{" browse  "}
           <span style={{ attributes: DIM }}>⏎</span>{" select  "}
@@ -1029,16 +1072,6 @@ function DetailPanel(props: DetailPanelProps) {
 
   const agents = () => props.session.agents ?? [];
   const hasAgents = () => agents().length > 0;
-  const portRows = () => {
-    const ports = props.session.ports ?? [];
-    const rows: number[][] = [];
-
-    for (let i = 0; i < ports.length; i += 3) {
-      rows.push(ports.slice(i, i + 3));
-    }
-
-    return rows;
-  };
 
   const truncDir = () => {
     const d = props.session.dir;
@@ -1050,79 +1083,49 @@ function DetailPanel(props: DetailPanelProps) {
 
   return (
     <box flexDirection="column" flexShrink={0} paddingLeft={1}>
-      <text
-        selectable={false}
-        onMouseDown={(event) => {
-          logResizeDebug("separator:onMouseDown", { x: event.x, y: event.y, button: event.button, session: props.session.name });
-          event.preventDefault();
-          props.onResizeStart(event);
-        }}
-        onMouseDrag={(event) => {
-          logResizeDebug("separator:onMouseDrag", { x: event.x, y: event.y, button: event.button, session: props.session.name });
-          event.preventDefault();
-          props.onResizeDrag(event);
-        }}
-        onMouseDragEnd={(event) => {
-          logResizeDebug("separator:onMouseDragEnd", { x: event.x, y: event.y, button: event.button, session: props.session.name });
-          event.preventDefault();
-          props.onResizeEnd(event);
-        }}
-        onMouseUp={(event) => {
-          logResizeDebug("separator:onMouseUp", { x: event.x, y: event.y, button: event.button, session: props.session.name });
-          event.preventDefault();
-          props.onResizeEnd(event);
-        }}
-        onMouseOver={() => props.onResizeHoverChange(true)}
-        onMouseOut={() => {
-          if (!props.isResizing) props.onResizeHoverChange(false);
-        }}
-        style={{
-          fg: props.isResizing
-            ? P().blue
-            : props.isResizeHover
-              ? P().overlay1
-              : P().surface2,
-        }}
-      >
-        {"─".repeat(26)}
-      </text>
+      <box height={1}>
+        <text
+          selectable={false}
+          onMouseDown={(event) => {
+            logResizeDebug("separator:onMouseDown", { x: event.x, y: event.y, button: event.button, session: props.session.name });
+            event.preventDefault();
+            props.onResizeStart(event);
+          }}
+          onMouseDrag={(event) => {
+            logResizeDebug("separator:onMouseDrag", { x: event.x, y: event.y, button: event.button, session: props.session.name });
+            event.preventDefault();
+            props.onResizeDrag(event);
+          }}
+          onMouseDragEnd={(event) => {
+            logResizeDebug("separator:onMouseDragEnd", { x: event.x, y: event.y, button: event.button, session: props.session.name });
+            event.preventDefault();
+            props.onResizeEnd(event);
+          }}
+          onMouseUp={(event) => {
+            logResizeDebug("separator:onMouseUp", { x: event.x, y: event.y, button: event.button, session: props.session.name });
+            event.preventDefault();
+            props.onResizeEnd(event);
+          }}
+          onMouseOver={() => props.onResizeHoverChange(true)}
+          onMouseOut={() => {
+            if (!props.isResizing) props.onResizeHoverChange(false);
+          }}
+          style={{
+            fg: props.isResizing
+              ? P().blue
+              : props.isResizeHover
+                ? P().overlay1
+                : P().surface2,
+          }}
+        >
+          {"─".repeat(200)}
+        </text>
+      </box>
 
       {/* Directory */}
       <text truncate>
         <span style={{ fg: P().overlay0, attributes: DIM }}>{truncDir()}</span>
       </text>
-
-      {/* Listening ports */}
-      <Show when={props.session.ports?.length}>
-        <box height={1} />
-        <For each={portRows()}>
-          {(ports, rowIndex) => (
-            <box flexDirection="row" paddingRight={1}>
-              <text flexShrink={0}>
-                <span style={{ fg: rowIndex() === 0 ? P().overlay0 : P().surface2, attributes: DIM }}>
-                  {rowIndex() === 0 ? "local " : "      "}
-                </span>
-              </text>
-              <For each={ports}>
-                {(port, portIndex) => (
-                  <box flexDirection="row" flexShrink={0}>
-                    <text onMouseDown={() => {
-                      Bun.spawn(["open", `http://localhost:${port}`], { stdout: "ignore", stderr: "ignore" });
-                    }}>
-                      <span style={{ fg: P().sky, attributes: BOLD }}>{String(port)}</span>
-                    </text>
-                    <Show when={portIndex() < ports.length - 1}>
-                      <text>
-                        <span style={{ fg: P().surface2 }}>{" · "}</span>
-                      </text>
-                    </Show>
-                  </box>
-                )}
-              </For>
-            </box>
-          )}
-        </For>
-      </Show>
 
       {/* Agent instances */}
       <Show when={hasAgents()}>
@@ -1284,7 +1287,6 @@ function SessionCard(props: SessionCardProps) {
     if (s === "error") return P().red;
     if (s === "interrupted") return P().peach;
     if (s === "running") return P().yellow;
-    if (s === "done") return P().green;
     if (props.isFocused) return P().lavender;
     return "transparent";
   };

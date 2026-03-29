@@ -92,25 +92,30 @@ function invalidateGitCache(dir?: string) {
 
 // --- Port detection ---
 
-const portCache = new Map<string, { ports: number[]; ts: number }>();
-const PORT_CACHE_TTL_MS = 5000;
+// Global port snapshot — refreshed by the port poll timer, read by computeState.
+// Runs lsof + ps once for ALL sessions instead of per-session.
+let portSnapshot = new Map<string, number[]>();
 
-function getSessionPorts(sessionName: string): number[] {
-  const cached = portCache.get(sessionName);
-  if (cached && Date.now() - cached.ts < PORT_CACHE_TTL_MS) return cached.ports;
-
+function refreshPortSnapshot(sessionNames: string[]): boolean {
   try {
-    // Get all pane PIDs for this session
-    const panePidResult = Bun.spawnSync(
-      ["tmux", "list-panes", "-s", "-t", sessionName, "-F", "#{pane_pid}"],
-      { stdout: "pipe", stderr: "pipe" },
-    );
-    const panePids = panePidResult.stdout.toString().trim().split("\n").filter(Boolean).map(Number);
-    if (panePids.length === 0) { portCache.set(sessionName, { ports: [], ts: Date.now() }); return []; }
+    // 1. Gather pane PIDs for all sessions in one tmux call per session
+    //    (tmux doesn't support multi-session list-panes, so we batch via a single format string)
+    const panePidsBySession = new Map<string, number[]>();
+    for (const name of sessionNames) {
+      const r = Bun.spawnSync(
+        ["tmux", "list-panes", "-s", "-t", name, "-F", "#{pane_pid}"],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+      const pids = r.stdout.toString().trim().split("\n").filter(Boolean).map(Number).filter((n) => !isNaN(n));
+      if (pids.length > 0) panePidsBySession.set(name, pids);
+    }
 
-    // Get full descendant tree for all pane PIDs using a single ps call.
-    // ps -o pid=,ppid= gives us every process's parent — we BFS from pane PIDs.
-    const allPids = new Set<number>(panePids);
+    if (panePidsBySession.size === 0) {
+      portSnapshot = new Map();
+      return false;
+    }
+
+    // 2. Build parent→children map from a single ps call
     const childrenOf = new Map<number, number[]>();
     const psResult = Bun.spawnSync(["ps", "-eo", "pid=,ppid="], { stdout: "pipe", stderr: "pipe" });
     for (const line of psResult.stdout.toString().trim().split("\n")) {
@@ -123,48 +128,89 @@ function getSessionPorts(sessionName: string): number[] {
       if (!arr) { arr = []; childrenOf.set(ppid, arr); }
       arr.push(pid);
     }
-    const queue = [...panePids];
-    while (queue.length > 0) {
-      const pid = queue.pop()!;
-      const kids = childrenOf.get(pid);
-      if (!kids) continue;
-      for (const kid of kids) {
-        if (!allPids.has(kid)) {
-          allPids.add(kid);
-          queue.push(kid);
+
+    // 3. BFS from pane PIDs to get full descendant tree per session
+    //    Also build a reverse map: pid → session name(s)
+    const pidToSessions = new Map<number, string[]>();
+    for (const [name, panePids] of panePidsBySession) {
+      const allPids = new Set<number>(panePids);
+      const queue = [...panePids];
+      while (queue.length > 0) {
+        const pid = queue.pop()!;
+        const kids = childrenOf.get(pid);
+        if (!kids) continue;
+        for (const kid of kids) {
+          if (!allPids.has(kid)) {
+            allPids.add(kid);
+            queue.push(kid);
+          }
         }
+      }
+      for (const pid of allPids) {
+        let arr = pidToSessions.get(pid);
+        if (!arr) { arr = []; pidToSessions.set(pid, arr); }
+        arr.push(name);
       }
     }
 
-    // Get all listening TCP ports
+    // 4. Single lsof call for all listening TCP ports
     const lsofResult = Bun.spawnSync(
-      ["lsof", "-iTCP", "-sTCP:LISTEN", "-nP", "-F", "pn"],
+      ["/usr/sbin/lsof", "-iTCP", "-sTCP:LISTEN", "-nP", "-F", "pn"],
       { stdout: "pipe", stderr: "pipe" },
     );
-    const lsofOutput = lsofResult.stdout.toString();
+    if (lsofResult.exitCode !== 0) {
+      log("ports", "lsof failed", { exitCode: lsofResult.exitCode, stderr: lsofResult.stderr.toString().slice(0, 200) });
+      return false;
+    }
 
-    // Parse lsof -F output: lines starting with 'p' = pid, 'n' = name (contains :port)
-    const ports = new Set<number>();
+    // 5. Parse and attribute ports to sessions
+    const sessionPorts = new Map<string, Set<number>>();
     let currentPid = 0;
-    for (const line of lsofOutput.split("\n")) {
+    for (const line of lsofResult.stdout.toString().split("\n")) {
       if (line.startsWith("p")) {
         currentPid = parseInt(line.slice(1), 10);
-      } else if (line.startsWith("n") && allPids.has(currentPid)) {
+      } else if (line.startsWith("n")) {
+        const sessions = pidToSessions.get(currentPid);
+        if (!sessions) continue;
         const match = line.match(/:(\d+)$/);
-        if (match) {
-          const port = parseInt(match[1], 10);
-          if (!isNaN(port)) ports.add(port);
+        if (!match) continue;
+        const port = parseInt(match[1], 10);
+        if (isNaN(port)) continue;
+        for (const name of sessions) {
+          let set = sessionPorts.get(name);
+          if (!set) { set = new Set(); sessionPorts.set(name, set); }
+          set.add(port);
         }
       }
     }
 
-    const result = [...ports].sort((a, b) => a - b);
-    portCache.set(sessionName, { ports: result, ts: Date.now() });
-    return result;
-  } catch {
-    portCache.set(sessionName, { ports: [], ts: Date.now() });
-    return [];
+    // 6. Build the new snapshot
+    const next = new Map<string, number[]>();
+    for (const name of sessionNames) {
+      const set = sessionPorts.get(name);
+      next.set(name, set ? [...set].sort((a, b) => a - b) : []);
+    }
+
+    const changed = !mapsEqual(portSnapshot, next);
+    portSnapshot = next;
+    return changed;
+  } catch (err) {
+    log("ports", "refreshPortSnapshot failed", { error: String(err) });
+    return false;
   }
+}
+
+function mapsEqual(a: Map<string, number[]>, b: Map<string, number[]>): boolean {
+  if (a.size !== b.size) return false;
+  for (const [k, v] of a) {
+    const bv = b.get(k);
+    if (!bv || bv.length !== v.length || v.some((n, i) => n !== bv[i])) return false;
+  }
+  return true;
+}
+
+function getSessionPorts(sessionName: string): number[] {
+  return portSnapshot.get(sessionName) ?? [];
 }
 
 // --- Git HEAD file watchers ---
@@ -1506,21 +1552,13 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   let portPollTimer: ReturnType<typeof setInterval> | null = null;
 
   function startPortPoll() {
+    // Run initial snapshot immediately so first broadcast has ports
+    if (lastState) {
+      refreshPortSnapshot(lastState.sessions.map((s) => s.name));
+    }
     portPollTimer = setInterval(() => {
       if (!lastState || clientCount === 0) return;
-      // Snapshot current ports per session
-      const prev = new Map<string, string>();
-      for (const s of lastState.sessions) {
-        prev.set(s.name, (s.ports ?? []).join(","));
-      }
-      // Invalidate cache so getSessionPorts re-runs
-      portCache.clear();
-      // Recompute ports and check for changes
-      let changed = false;
-      for (const s of lastState.sessions) {
-        const fresh = getSessionPorts(s.name).join(",");
-        if (fresh !== (prev.get(s.name) ?? "")) { changed = true; break; }
-      }
+      const changed = refreshPortSnapshot(lastState.sessions.map((s) => s.name));
       if (changed) broadcastState();
     }, PORT_POLL_INTERVAL_MS);
   }
@@ -1645,6 +1683,13 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
         clientCount--;
         if (clientCount < 0) clientCount = 0;
         log("ws", "client disconnected", { clientCount });
+        if (clientCount === 0 && !idleTimer) {
+          log("ws", "no clients remaining, starting idle timer", { timeoutMs: SERVER_IDLE_TIMEOUT_MS });
+          idleTimer = setTimeout(() => {
+            log("ws", "idle timeout reached, shutting down");
+            quitAll();
+          }, SERVER_IDLE_TIMEOUT_MS);
+        }
       },
       message(ws, msg) {
         try {
@@ -1659,6 +1704,14 @@ export function startServer(mux: MuxProvider, extraProviders?: MuxProvider[], wa
   // --- Bootstrap ---
 
   for (const p of allProviders) p.setupHooks(SERVER_HOST, SERVER_PORT);
+  // Seed port snapshot before first broadcast so clients see ports immediately
+  {
+    const allMuxSessions: string[] = [];
+    for (const p of allProviders) {
+      for (const s of p.listSessions()) allMuxSessions.push(s.name);
+    }
+    refreshPortSnapshot(allMuxSessions);
+  }
   broadcastState();
   startPortPoll();
   startPaneScan();
