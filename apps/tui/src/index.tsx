@@ -1278,13 +1278,13 @@ function SessionCard(props: SessionCardProps) {
     unseen() && ["done", "error", "interrupted"].includes(status());
 
   const accentColor = () => {
+    if (props.isCurrent) return P().green;
     if (isUnseenTerminal()) return unseenAccentColor();
     const s = status();
     if (s === "error") return P().red;
     if (s === "interrupted") return P().peach;
     if (s === "running") return P().yellow;
     if (s === "done") return P().green;
-    if (props.isCurrent) return P().green;
     if (props.isFocused) return P().lavender;
     return "transparent";
   };
