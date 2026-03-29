@@ -41,6 +41,16 @@ If you want the same setup as a single shell command:
 grep -q "Ataraxy-Labs/opensessions" ~/.tmux.conf 2>/dev/null || printf '\nset -g @plugin '\''Ataraxy-Labs/opensessions'\''\n' >> ~/.tmux.conf && tmux source-file ~/.tmux.conf && ~/.tmux/plugins/tpm/bin/install_plugins
 ```
 
+## Uninstall
+
+Run the uninstall script **before** removing the plugin files — it cleans up tmux hooks, keybindings, sidebar panes, and environment variables that would otherwise persist and cause glitching:
+
+```bash
+sh ~/.tmux/plugins/opensessions/integrations/tmux-plugin/scripts/uninstall.sh
+```
+
+Then remove the `set -g @plugin 'Ataraxy-Labs/opensessions'` line from `~/.tmux.conf` and run `prefix + alt + u` (TPM uninstall).
+
 ## Support Status
 
 - `@opensessions/mux-tmux` and the tmux plugin flow are supported.
