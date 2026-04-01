@@ -58,6 +58,7 @@ export function determineStatus(entry: PiEntry): AgentStatus {
   if (!message?.role) return "idle";
 
   if (message.role === "user") return "running";
+  if (message.role === "toolResult") return "running";
   if (message.role !== "assistant") return "idle";
 
   switch (message.stopReason) {
