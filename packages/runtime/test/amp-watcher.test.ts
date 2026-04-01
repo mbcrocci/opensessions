@@ -3,6 +3,16 @@ import { AmpAgentWatcher, determineStatus } from "../src/agents/watchers/amp";
 import type { AgentEvent } from "../src/contracts/agent";
 import type { AgentWatcherContext } from "../src/contracts/agent-watcher";
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 // --- determineStatus ---
 
 describe("Amp determineStatus", () => {
@@ -577,6 +587,35 @@ describe("AmpAgentWatcher", () => {
 
     expect(events).toHaveLength(0);
   });
+
+  test("request timeout clears scanning so polling can recover", async () => {
+    watcher._fetchTimeoutMs = 10;
+    let calls = 0;
+    watcher._fetch = async (_input, init) => {
+      calls++;
+      if (calls === 1) {
+        return await new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal as AbortSignal | undefined;
+          signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        });
+      }
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+
+    (watcher as any).ctx = ctx;
+    (watcher as any).ampUrl = "https://test.ampcode.com";
+    (watcher as any).apiKey = "sgamp_test_key";
+
+    await (watcher as any).poll();
+    expect((watcher as any).scanning).toBe(false);
+
+    await (watcher as any).poll();
+    expect(calls).toBe(2);
+    expect((watcher as any).scanning).toBe(false);
+  });
 });
 
 // --- DTW WebSocket tests ---
@@ -908,5 +947,197 @@ describe("AmpAgentWatcher WebSocket (DTW)", () => {
     expect(MockWebSocket.instances.length).toBe(0);
     expect(events).toHaveLength(1);
     expect(events[0]!.status).toBe("running");
+  });
+
+  test("does not connect WebSocket for threads outside local sessions", async () => {
+    dtwTokens.set("T-ws-012", "test-token-012");
+    setThread("T-ws-012", {
+      v: 1,
+      env: mkEnv("/projects/other"),
+      messages: [{ role: "user" }],
+    });
+
+    await startWatcher();
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(MockWebSocket.instances.length).toBe(0);
+    expect(events).toHaveLength(0);
+  });
+
+  test("poll-detected terminal status disconnects WebSocket", async () => {
+    dtwTokens.set("T-ws-013", "test-token-013");
+    setThread("T-ws-013", {
+      v: 1,
+      title: "Running thread",
+      env: mkEnv("/projects/myapp"),
+      messages: [{ role: "user" }],
+    });
+
+    await startWatcher();
+    await new Promise((r) => setTimeout(r, 50));
+    events = [];
+
+    const ws = MockWebSocket.instances[0]!;
+    setThread("T-ws-013", {
+      v: 2,
+      title: "Done thread",
+      env: mkEnv("/projects/myapp"),
+      messages: [{ role: "assistant", state: { type: "complete", stopReason: "end_turn" } }],
+    });
+
+    await (watcher as any).poll();
+
+    expect(ws.closed).toBe(true);
+    expect((watcher as any).wsConnections.size).toBe(0);
+    expect(events.some((event) => event.status === "done")).toBe(true);
+  });
+
+  test("unexpected close reconnects active threads without a version bump", async () => {
+    watcher._wsRetryMs = 0;
+    dtwTokens.set("T-ws-014", "test-token-014");
+    setThread("T-ws-014", {
+      v: 1,
+      title: "Reconnect me",
+      env: mkEnv("/projects/myapp"),
+      messages: [{ role: "user" }],
+    });
+
+    await startWatcher();
+    await new Promise((r) => setTimeout(r, 50));
+
+    const ws = MockWebSocket.instances[0]!;
+    ws.close();
+
+    await (watcher as any).poll();
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(MockWebSocket.instances.length).toBe(2);
+    expect((watcher as any).wsConnections.size).toBe(1);
+  });
+
+  test("waiting from WebSocket can still promote to stale", async () => {
+    dtwTokens.set("T-ws-015", "test-token-015");
+    setThread("T-ws-015", {
+      v: 1,
+      title: "Waiting thread",
+      env: mkEnv("/projects/myapp"),
+      messages: [{ role: "user" }],
+    });
+
+    await startWatcher();
+    await new Promise((r) => setTimeout(r, 50));
+    events = [];
+
+    const ws = MockWebSocket.instances[0]!;
+    ws.simulateMessage({ state: "waiting" });
+
+    const snapshot = (watcher as any).threads.get("T-ws-015");
+    snapshot.lastGrowthAt = Date.now() - 121_000;
+
+    await (watcher as any).poll();
+
+    expect(events.some((event) => event.status === "stale")).toBe(true);
+    expect(ws.closed).toBe(true);
+  });
+
+  test("duplicate connect attempts do not create orphan sockets", async () => {
+    const tokenReply = deferred<Response>();
+    watcher._fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("/api/durable-thread-workers") && init?.method === "POST") {
+        return await tokenReply.promise;
+      }
+      return new Response("Not Found", { status: 404 });
+    };
+
+    (watcher as any).ctx = ctx;
+    (watcher as any).ampUrl = "https://test.ampcode.com";
+    (watcher as any).apiKey = "sgamp_test_key";
+    (watcher as any).threads.set("T-ws-race", {
+      status: "running",
+      version: 1,
+      title: "Race thread",
+      projectDir: "/projects/myapp",
+      lastGrowthAt: Date.now(),
+      waitingEligible: false,
+      lastListedAt: Date.now(),
+      statusUpdatedAt: Date.now(),
+    });
+
+    const p1 = (watcher as any).connectWebSocket("T-ws-race");
+    const p2 = (watcher as any).connectWebSocket("T-ws-race");
+    tokenReply.resolve(new Response(JSON.stringify({ wsToken: "race-token" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+
+    await Promise.all([p1, p2]);
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(MockWebSocket.instances.length).toBe(1);
+    expect((watcher as any).wsConnections.size).toBe(1);
+  });
+
+  test("stop prevents delayed token fetch from reviving a socket", async () => {
+    const tokenReply = deferred<Response>();
+    watcher._fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("/api/durable-thread-workers") && init?.method === "POST") {
+        return await tokenReply.promise;
+      }
+      return new Response("Not Found", { status: 404 });
+    };
+
+    (watcher as any).ctx = ctx;
+    (watcher as any).ampUrl = "https://test.ampcode.com";
+    (watcher as any).apiKey = "sgamp_test_key";
+    (watcher as any).threads.set("T-ws-stop", {
+      status: "running",
+      version: 1,
+      title: "Stop thread",
+      projectDir: "/projects/myapp",
+      lastGrowthAt: Date.now(),
+      waitingEligible: false,
+      lastListedAt: Date.now(),
+      statusUpdatedAt: Date.now(),
+    });
+
+    const connectPromise = (watcher as any).connectWebSocket("T-ws-stop");
+    watcher.stop();
+    tokenReply.resolve(new Response(JSON.stringify({ wsToken: "stop-token" }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+
+    await connectPromise;
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(MockWebSocket.instances.length).toBe(0);
+    expect((watcher as any).wsConnections.size).toBe(0);
+  });
+
+  test("old socket close does not delete the replacement socket", async () => {
+    dtwTokens.set("T-ws-016", "test-token-016");
+    setThread("T-ws-016", {
+      v: 1,
+      title: "Identity-safe close",
+      env: mkEnv("/projects/myapp"),
+      messages: [{ role: "user" }],
+    });
+
+    await startWatcher();
+    await new Promise((r) => setTimeout(r, 50));
+
+    const oldSocket = MockWebSocket.instances[0]!;
+    const replacement = new MockWebSocket("wss://replacement");
+    (watcher as any).wsConnections.set("T-ws-016", {
+      gen: 999,
+      phase: "open",
+      ws: replacement,
+    });
+
+    oldSocket.close();
+
+    expect((watcher as any).wsConnections.get("T-ws-016")?.ws).toBe(replacement);
   });
 });

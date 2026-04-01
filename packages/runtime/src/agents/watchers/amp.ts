@@ -72,8 +72,6 @@ import type { AgentStatus } from "../../contracts/agent";
 import { TERMINAL_STATUSES } from "../../contracts/agent";
 import type { AgentWatcher, AgentWatcherContext } from "../../contracts/agent-watcher";
 
-// --- Thread/message types ---
-
 interface MessageState {
   type?: string;
   stopReason?: string;
@@ -98,10 +96,20 @@ interface ThreadSnapshot {
   version: number;
   title?: string;
   projectDir?: string;
-  /** Timestamp when we last saw the version advance. For stuck detection. */
+  /** Timestamp when we last saw meaningful progress. For stuck detection. */
   lastGrowthAt?: number;
   /** Whether this running snapshot represents a quiet tool boundary that should become waiting. */
   waitingEligible?: boolean;
+  /** Last time this thread appeared in the recent thread list. */
+  lastListedAt: number;
+  /** Last time the effective status changed. Used to ignore stale async poll responses. */
+  statusUpdatedAt: number;
+}
+
+interface WebSocketConnection {
+  gen: number;
+  phase: "connecting" | "open";
+  ws: WebSocket | null;
 }
 
 /** API thread list item — subset of fields we use */
@@ -151,8 +159,8 @@ const TOOL_WAIT_MS = 3_000;
 const STUCK_RUNNING_MS = 2 * 60 * 1000;
 /** Only consider threads updated in the last 5 minutes */
 const RECENT_MS = 5 * 60 * 1000;
-
-// --- Status detection ---
+const FETCH_TIMEOUT_MS = 10_000;
+const WS_RETRY_MS = 5_000;
 
 /**
  * Determine the agent status from the last message in a thread.
@@ -178,11 +186,9 @@ export function determineStatus(lastMsg: { role?: string; state?: MessageState; 
     if (state.type === "complete") {
       if (state.stopReason === "tool_use") return "running";
       if (state.stopReason === "end_turn") return "done";
-      // Other stop reasons (max_tokens, etc.) are terminal failures.
       return "error";
     }
 
-    // Unknown state type — defensive, treat as running
     return "running";
   }
 
@@ -211,8 +217,6 @@ function isWaitingCandidate(lastMsg: Message | null): boolean {
   return false;
 }
 
-// --- Credential / config loading ---
-
 async function loadAmpUrl(): Promise<string> {
   try {
     const settingsPath = join(homedir(), ".config", "amp", "settings.json");
@@ -220,7 +224,6 @@ async function loadAmpUrl(): Promise<string> {
     const settings = JSON.parse(raw);
     if (settings.url && typeof settings.url === "string") return settings.url.replace(/\/$/, "");
   } catch {
-    // settings.json doesn't exist or is unreadable
   }
   return "https://ampcode.com";
 }
@@ -231,7 +234,6 @@ async function loadApiKey(ampUrl: string): Promise<string | null> {
     const raw = await Bun.file(secretsPath).text();
     const secrets = JSON.parse(raw);
 
-    // Try URL-specific key first (with and without trailing slash)
     const urlWithSlash = ampUrl.endsWith("/") ? ampUrl : `${ampUrl}/`;
     const urlWithoutSlash = ampUrl.replace(/\/$/, "");
 
@@ -246,14 +248,10 @@ async function loadApiKey(ampUrl: string): Promise<string | null> {
   }
 }
 
-// --- API helpers ---
-
 function extractProjectDir(thread: { env?: { initial?: { trees?: Array<{ uri?: string }> } } }): string | undefined {
   const uri = thread.env?.initial?.trees?.[0]?.uri ?? "";
   return uri.startsWith("file://") ? uri.slice(7) : undefined;
 }
-
-// --- Watcher implementation ---
 
 export class AmpAgentWatcher implements AgentWatcher {
   readonly name = "amp";
@@ -261,15 +259,23 @@ export class AmpAgentWatcher implements AgentWatcher {
   /** Internal thread state — exposed for testing via (watcher as any).threads */
   private threads = new Map<string, ThreadSnapshot>();
   /** Active WebSocket connections per thread ID */
-  private wsConnections = new Map<string, WebSocket>();
+  private wsConnections = new Map<string, WebSocketConnection>();
+  private wsRetryAfter = new Map<string, number>();
+  private requestControllers = new Set<AbortController>();
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private ctx: AgentWatcherContext | null = null;
   private scanning = false;
   private seeded = false;
+  private stopped = false;
+  private lifecycle = 0;
+  private wsGeneration = 0;
 
   /** Loaded once at start. Overridable for testing. */
   private ampUrl: string | null = null;
   private apiKey: string | null = null;
+
+  _fetchTimeoutMs = FETCH_TIMEOUT_MS;
+  _wsRetryMs = WS_RETRY_MS;
 
   /**
    * Override the fetch function for testing.
@@ -284,35 +290,114 @@ export class AmpAgentWatcher implements AgentWatcher {
   _WebSocket: typeof WebSocket = globalThis.WebSocket;
 
   start(ctx: AgentWatcherContext): void {
+    this.stopped = false;
     this.ctx = ctx;
-    this.initAndPoll();
+    const lifecycle = ++this.lifecycle;
+    void this.initAndPoll(lifecycle);
   }
 
   stop(): void {
+    this.stopped = true;
+    this.lifecycle++;
     if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = null; }
-    for (const [, ws] of this.wsConnections) {
-      try { ws.close(); } catch {}
+    for (const controller of this.requestControllers) {
+      try { controller.abort(); } catch {}
+    }
+    this.requestControllers.clear();
+    for (const [, connection] of this.wsConnections) {
+      if (!connection.ws) continue;
+      try { connection.ws.close(); } catch {}
     }
     this.wsConnections.clear();
+    this.wsRetryAfter.clear();
+    this.threads.clear();
+    this.seeded = false;
+    this.scanning = false;
+    this.ampUrl = null;
+    this.apiKey = null;
     this.ctx = null;
   }
 
-  private async initAndPoll(): Promise<void> {
-    this.ampUrl = await loadAmpUrl();
-    this.apiKey = await loadApiKey(this.ampUrl);
-    if (!this.apiKey) return;
+  private isActive(lifecycle = this.lifecycle): boolean {
+    return !this.stopped && this.ctx !== null && this.lifecycle === lifecycle;
+  }
 
-    // First scan is the seed
-    await this.poll();
-    this.pollTimer = setInterval(() => this.poll(), POLL_MS);
+  private resolveMuxSession(projectDir?: string): string | null {
+    if (!this.ctx || !projectDir) return null;
+    const session = this.ctx.resolveSession(projectDir);
+    return session && session !== "unknown" ? session : null;
+  }
+
+  private shouldStreamThread(snapshot: ThreadSnapshot | undefined): boolean {
+    return !!snapshot
+      && snapshot.status !== "idle"
+      && !TERMINAL_STATUSES.has(snapshot.status)
+      && !!this.resolveMuxSession(snapshot.projectDir);
+  }
+
+  private scheduleRetry(threadId: string, now = Date.now()): void {
+    this.wsRetryAfter.set(threadId, now + this._wsRetryMs);
+  }
+
+  private clearRetry(threadId: string): void {
+    this.wsRetryAfter.delete(threadId);
+  }
+
+  private shouldRetry(threadId: string, now = Date.now()): boolean {
+    return (this.wsRetryAfter.get(threadId) ?? 0) <= now;
+  }
+
+  private disconnectWebSocket(threadId: string): void {
+    const connection = this.wsConnections.get(threadId);
+    this.wsConnections.delete(threadId);
+    this.clearRetry(threadId);
+    if (connection?.ws) {
+      try { connection.ws.close(); } catch {}
+    }
+  }
+
+  private syncStreamConnection(threadId: string, snapshot: ThreadSnapshot | undefined, now: number, lifecycle = this.lifecycle): void {
+    if (!this.isActive(lifecycle)) return;
+    if (!this.shouldStreamThread(snapshot)) {
+      this.disconnectWebSocket(threadId);
+      return;
+    }
+    if (this.wsConnections.has(threadId)) return;
+    if (!this.shouldRetry(threadId, now)) return;
+    void this.connectWebSocket(threadId, lifecycle);
+  }
+
+  private pruneDormantThreads(now: number): void {
+    for (const [threadId, snapshot] of this.threads) {
+      if (now - snapshot.lastListedAt <= RECENT_MS) continue;
+      this.disconnectWebSocket(threadId);
+      this.threads.delete(threadId);
+    }
+  }
+
+  private async initAndPoll(lifecycle: number): Promise<void> {
+    const ampUrl = await loadAmpUrl();
+    if (!this.isActive(lifecycle)) return;
+    this.ampUrl = ampUrl;
+
+    const apiKey = await loadApiKey(ampUrl);
+    if (!this.isActive(lifecycle)) return;
+    this.apiKey = apiKey;
+    if (!apiKey) return;
+
+    await this.poll(lifecycle);
+    if (!this.isActive(lifecycle)) return;
+    this.pollTimer = setInterval(() => {
+      void this.poll(lifecycle);
+    }, POLL_MS);
   }
 
   /** Emit a status change event if we have a valid session mapping */
   private emitStatus(threadId: string, snapshot: ThreadSnapshot): boolean {
-    if (!this.ctx || !snapshot.projectDir || snapshot.status === "idle") return false;
+    if (!this.ctx || snapshot.status === "idle") return false;
 
-    const session = this.ctx.resolveSession(snapshot.projectDir);
-    if (!session || session === "unknown") return false;
+    const session = this.resolveMuxSession(snapshot.projectDir);
+    if (!session) return false;
 
     this.ctx.emit({
       agent: "amp",
@@ -325,14 +410,15 @@ export class AmpAgentWatcher implements AgentWatcher {
     return true;
   }
 
-  private async poll(): Promise<void> {
-    if (this.scanning || !this.ctx || !this.ampUrl || !this.apiKey) return;
+  private async poll(lifecycle = this.lifecycle): Promise<void> {
+    if (this.scanning || !this.isActive(lifecycle) || !this.ampUrl || !this.apiKey) return;
     this.scanning = true;
     const initialSeed = !this.seeded;
 
     try {
-      const threads = await this.fetchThreadList();
+      const threads = await this.fetchThreadList(lifecycle);
       if (!threads) return;
+      if (!this.isActive(lifecycle)) return;
 
       const now = Date.now();
 
@@ -341,15 +427,17 @@ export class AmpAgentWatcher implements AgentWatcher {
         if (now - updatedAt > RECENT_MS) continue;
 
         const prev = this.threads.get(thread.id);
+        if (prev) prev.lastListedAt = now;
 
-        // Version unchanged — check waiting/stale timers
         if (prev && thread.v === prev.version) {
           if (!this.seeded) continue;
 
           if (prev.status === "running" && prev.waitingEligible && prev.lastGrowthAt && now - prev.lastGrowthAt >= TOOL_WAIT_MS) {
             prev.status = "waiting";
             prev.waitingEligible = false;
+            prev.statusUpdatedAt = now;
             this.emitStatus(thread.id, prev);
+            this.syncStreamConnection(thread.id, prev, now, lifecycle);
             continue;
           }
 
@@ -357,25 +445,28 @@ export class AmpAgentWatcher implements AgentWatcher {
             prev.status = "stale";
             prev.lastGrowthAt = undefined;
             prev.waitingEligible = false;
+            prev.statusUpdatedAt = now;
             this.emitStatus(thread.id, prev);
+            this.syncStreamConnection(thread.id, prev, now, lifecycle);
             continue;
           }
 
+          this.syncStreamConnection(thread.id, prev, now, lifecycle);
           continue;
         }
 
-        // Version changed or new thread — fetch full detail
-        await this.processThread(thread.id, thread, prev, now);
+        await this.processThread(thread.id, thread, now, lifecycle);
+        if (!this.isActive(lifecycle)) return;
       }
+
+      this.pruneDormantThreads(now);
     } finally {
-      if (initialSeed) {
+      if (initialSeed && this.isActive(lifecycle)) {
         this.seeded = true;
+        const now = Date.now();
         for (const [threadId, snapshot] of this.threads) {
           this.emitStatus(threadId, snapshot);
-          // Connect WebSockets for running threads discovered during seed
-          if (!TERMINAL_STATUSES.has(snapshot.status) && snapshot.status !== "idle" && !this.wsConnections.has(threadId)) {
-            this.connectWebSocket(threadId);
-          }
+          this.syncStreamConnection(threadId, snapshot, now, lifecycle);
         }
       }
       this.scanning = false;
@@ -385,27 +476,36 @@ export class AmpAgentWatcher implements AgentWatcher {
   private async processThread(
     threadId: string,
     summary: ApiThreadSummary,
-    prev: ThreadSnapshot | undefined,
     now: number,
+    lifecycle = this.lifecycle,
   ): Promise<void> {
-    const detail = await this.fetchThreadDetail(threadId);
+    const fetchStartedAt = Date.now();
+    const detail = await this.fetchThreadDetail(threadId, lifecycle);
     if (!detail) return;
+    if (!this.isActive(lifecycle)) return;
 
     const messages = detail.messages ?? [];
     const lastMsg = messages.length > 0 ? messages[messages.length - 1] : null;
     const projectDir = extractProjectDir(detail);
     const title = detail.title || undefined;
     const version = detail.v ?? summary.v ?? 0;
+    const current = this.threads.get(threadId);
 
-    const status = determineStatus(lastMsg ? { role: lastMsg.role, state: lastMsg.state, interrupted: lastMsg.interrupted, content: lastMsg.content } : null);
-    const waitingEligible = status === "running" && isWaitingCandidate(lastMsg);
-    const statusChanged = prev?.status !== status;
-    const titleChanged = prev?.title !== title;
-    const projectDirChanged = prev?.projectDir !== projectDir;
+    if (current && current.version > version) return;
 
-    if (prev && version === prev.version && !statusChanged && !titleChanged && !projectDirChanged) {
-      if (prev.status === "running" || prev.status === "tool-running" || prev.status === "waiting") prev.lastGrowthAt = now;
-      prev.waitingEligible = waitingEligible;
+    const polledStatus = determineStatus(lastMsg ? { role: lastMsg.role, state: lastMsg.state, interrupted: lastMsg.interrupted, content: lastMsg.content } : null);
+    const polledWaitingEligible = polledStatus === "running" && isWaitingCandidate(lastMsg);
+    const preserveRealtimeStatus = !!current && current.version === version && current.statusUpdatedAt > fetchStartedAt;
+    const status = preserveRealtimeStatus ? current.status : polledStatus;
+    const waitingEligible = preserveRealtimeStatus ? current.waitingEligible : polledWaitingEligible;
+    const base = current;
+    const statusChanged = base?.status !== status;
+    const titleChanged = base?.title !== title;
+    const projectDirChanged = base?.projectDir !== projectDir;
+
+    if (base && version === base.version && !statusChanged && !titleChanged && !projectDirChanged) {
+      base.lastListedAt = now;
+      base.waitingEligible = waitingEligible;
       return;
     }
 
@@ -414,56 +514,109 @@ export class AmpAgentWatcher implements AgentWatcher {
       version,
       title,
       projectDir,
-      lastGrowthAt: (status === "running" || status === "tool-running") ? now : undefined,
+      lastGrowthAt: preserveRealtimeStatus
+        ? current.lastGrowthAt
+        : status === "running" || status === "tool-running"
+          ? now
+          : status === "waiting"
+            ? current?.lastGrowthAt ?? now
+            : undefined,
       waitingEligible,
+      lastListedAt: now,
+      statusUpdatedAt: preserveRealtimeStatus
+        ? current.statusUpdatedAt
+        : statusChanged
+          ? now
+          : base?.statusUpdatedAt ?? now,
     };
     this.threads.set(threadId, snapshot);
 
-    // Seed mode: record state without emitting
     if (!this.seeded) return;
 
-    if (statusChanged || titleChanged) this.emitStatus(threadId, snapshot);
-
-    // Connect WebSocket for actively running threads (non-terminal, non-idle)
-    if (!TERMINAL_STATUSES.has(status) && status !== "idle" && !this.wsConnections.has(threadId)) {
-      this.connectWebSocket(threadId);
-    }
+    if (statusChanged || titleChanged || projectDirChanged) this.emitStatus(threadId, snapshot);
+    this.syncStreamConnection(threadId, snapshot, now, lifecycle);
   }
 
-  // --- DTW WebSocket streaming ---
-
-  private async connectWebSocket(threadId: string): Promise<void> {
-    if (!this.ampUrl || !this.apiKey) return;
+  private async connectWebSocket(threadId: string, lifecycle = this.lifecycle): Promise<void> {
+    if (!this.isActive(lifecycle) || !this.ampUrl || !this.apiKey) return;
     if (this.wsConnections.has(threadId)) return;
+    if (!this.shouldRetry(threadId)) return;
 
-    const token = await this.fetchDtwToken(threadId);
-    if (!token) return;
+    const snapshot = this.threads.get(threadId);
+    if (!this.shouldStreamThread(snapshot)) return;
+
+    const gen = ++this.wsGeneration;
+    this.wsConnections.set(threadId, { gen, phase: "connecting", ws: null });
+
+    const token = await this.fetchDtwToken(threadId, lifecycle);
+    const connection = this.wsConnections.get(threadId);
+    if (!this.isActive(lifecycle) || !connection || connection.gen !== gen) return;
+
+    if (!token) {
+      this.wsConnections.delete(threadId);
+      this.scheduleRetry(threadId);
+      return;
+    }
+
+    const latestSnapshot = this.threads.get(threadId);
+    if (!this.shouldStreamThread(latestSnapshot)) {
+      this.wsConnections.delete(threadId);
+      this.clearRetry(threadId);
+      return;
+    }
 
     try {
       const wsUrl = `${DTW_WS_BASE}/threads/${threadId}?wsToken=${token}`;
       const ws = new this._WebSocket(wsUrl);
+      const current = this.wsConnections.get(threadId);
+      if (!current || current.gen !== gen) {
+        try { ws.close(); } catch {}
+        return;
+      }
 
-      this.wsConnections.set(threadId, ws);
+      current.phase = "open";
+      current.ws = ws;
+      this.clearRetry(threadId);
 
       ws.onmessage = (event) => {
-        this.handleWsMessage(threadId, event.data);
+        this.handleWsMessage(threadId, gen, event.data);
       };
 
       ws.onclose = () => {
+        const active = this.wsConnections.get(threadId);
+        if (!active || active.gen !== gen || active.ws !== ws) return;
         this.wsConnections.delete(threadId);
+        if (this.shouldStreamThread(this.threads.get(threadId)) && this.isActive(lifecycle)) {
+          this.scheduleRetry(threadId);
+        } else {
+          this.clearRetry(threadId);
+        }
       };
 
       ws.onerror = () => {
+        const active = this.wsConnections.get(threadId);
+        if (!active || active.gen !== gen || active.ws !== ws) return;
         this.wsConnections.delete(threadId);
+        if (this.shouldStreamThread(this.threads.get(threadId)) && this.isActive(lifecycle)) {
+          this.scheduleRetry(threadId);
+        } else {
+          this.clearRetry(threadId);
+        }
         try { ws.close(); } catch {}
       };
     } catch {
-      // WebSocket construction failed — polling will handle it
+      const active = this.wsConnections.get(threadId);
+      if (active?.gen === gen) {
+        this.wsConnections.delete(threadId);
+        this.scheduleRetry(threadId);
+      }
     }
   }
 
-  private handleWsMessage(threadId: string, data: unknown): void {
+  private handleWsMessage(threadId: string, gen: number, data: unknown): void {
     if (!this.ctx) return;
+    const connection = this.wsConnections.get(threadId);
+    if (!connection || connection.gen !== gen) return;
 
     try {
       const raw = typeof data === "string" ? data : String(data);
@@ -473,82 +626,70 @@ export class AmpAgentWatcher implements AgentWatcher {
 
       const status = msg.state as AgentStatus;
       const snapshot = this.threads.get(threadId);
-      if (!snapshot) return;
-
-      const now = Date.now();
-
-      if (snapshot.status === status) {
-        // Same status — update growth timestamp
-        if (status === "running" || status === "tool-running") {
-          snapshot.lastGrowthAt = now;
-        }
+      if (!snapshot) {
+        this.disconnectWebSocket(threadId);
         return;
       }
 
+      if (snapshot.status === status) return;
+
+      const now = Date.now();
       snapshot.status = status;
-      snapshot.lastGrowthAt = (status === "running" || status === "tool-running") ? now : undefined;
+      snapshot.lastGrowthAt = status === "running" || status === "tool-running"
+        ? now
+        : status === "waiting"
+          ? snapshot.lastGrowthAt ?? now
+          : undefined;
       snapshot.waitingEligible = false;
+      snapshot.statusUpdatedAt = now;
 
       this.emitStatus(threadId, snapshot);
 
-      // Disconnect on terminal states — polling will pick up any future changes
       if (TERMINAL_STATUSES.has(status) || status === "idle") {
         this.disconnectWebSocket(threadId);
       }
     } catch {
-      // Malformed message — ignore
     }
   }
 
-  private disconnectWebSocket(threadId: string): void {
-    const ws = this.wsConnections.get(threadId);
-    if (ws) {
-      this.wsConnections.delete(threadId);
-      try { ws.close(); } catch {}
-    }
-  }
+  private async fetchJson<T>(url: string, init: RequestInit = {}, lifecycle = this.lifecycle): Promise<T | null> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this._fetchTimeoutMs);
+    this.requestControllers.add(controller);
 
-  private async fetchDtwToken(threadId: string): Promise<string | null> {
     try {
-      const res = await this._fetch(`${this.ampUrl}/api/durable-thread-workers`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ threadId }),
-      });
-      if (!res.ok) return null;
-      const body = await res.json() as DtwTokenResponse;
-      return body.wsToken ?? null;
+      const res = await this._fetch(url, { ...init, signal: controller.signal });
+      if (!this.isActive(lifecycle) || !res.ok) return null;
+      return await res.json() as T;
     } catch {
       return null;
+    } finally {
+      clearTimeout(timeout);
+      this.requestControllers.delete(controller);
     }
   }
 
-  // --- API helpers ---
-
-  private async fetchThreadList(): Promise<ApiThreadSummary[] | null> {
-    try {
-      const res = await this._fetch(`${this.ampUrl}/api/threads?limit=20`, {
-        headers: { Authorization: `Bearer ${this.apiKey}` },
-      });
-      if (!res.ok) return null;
-      return await res.json() as ApiThreadSummary[];
-    } catch {
-      return null;
-    }
+  private async fetchDtwToken(threadId: string, lifecycle = this.lifecycle): Promise<string | null> {
+    const body = await this.fetchJson<DtwTokenResponse>(`${this.ampUrl}/api/durable-thread-workers`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ threadId }),
+    }, lifecycle);
+    return body?.wsToken ?? null;
   }
 
-  private async fetchThreadDetail(threadId: string): Promise<ApiThreadDetail | null> {
-    try {
-      const res = await this._fetch(`${this.ampUrl}/api/threads/${threadId}`, {
-        headers: { Authorization: `Bearer ${this.apiKey}` },
-      });
-      if (!res.ok) return null;
-      return await res.json() as ApiThreadDetail;
-    } catch {
-      return null;
-    }
+  private async fetchThreadList(lifecycle = this.lifecycle): Promise<ApiThreadSummary[] | null> {
+    return this.fetchJson<ApiThreadSummary[]>(`${this.ampUrl}/api/threads?limit=20`, {
+      headers: { Authorization: `Bearer ${this.apiKey}` },
+    }, lifecycle);
+  }
+
+  private async fetchThreadDetail(threadId: string, lifecycle = this.lifecycle): Promise<ApiThreadDetail | null> {
+    return this.fetchJson<ApiThreadDetail>(`${this.ampUrl}/api/threads/${threadId}`, {
+      headers: { Authorization: `Bearer ${this.apiKey}` },
+    }, lifecycle);
   }
 }
