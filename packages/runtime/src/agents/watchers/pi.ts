@@ -262,7 +262,7 @@ export class PiAgentWatcher implements AgentWatcher {
       session,
       status: nextSnapshot.status,
       ts: Date.now(),
-      threadId: nextSnapshot.sessionId ?? threadId,
+      threadId: threadId,
       ...(nextSnapshot.threadName && { threadName: nextSnapshot.threadName }),
     });
   }
