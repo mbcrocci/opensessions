@@ -236,7 +236,6 @@ export class PiAgentWatcher implements AgentWatcher {
       nextSnapshot = applyEntries(text, {
         status: "idle",
         fileSize: fileStat.size,
-        projectDir: encodedDir,
       });
     }
 

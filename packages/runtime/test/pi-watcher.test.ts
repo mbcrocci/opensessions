@@ -82,17 +82,22 @@ describe("PiAgentWatcher", () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  test("seed scan does not emit events", async () => {
+  test("seed scan emits events for non-idle sessions", async () => {
     watcher.start(ctx);
     await new Promise((resolve) => setTimeout(resolve, 200));
 
-    expect(events).toHaveLength(0);
+    expect(events).toHaveLength(1);
+    expect(events[0]!.agent).toBe("pi");
+    expect(events[0]!.session).toBe("myapp-session");
+    expect(events[0]!.status).toBe("running");
+    expect(events[0]!.threadId).toBe("12345678-1234-1234-1234-123456789abc");
+    expect(events[0]!.threadName).toBe("Fix the watcher status mapping");
   });
 
   test("emits done when Pi writes a final assistant turn", async () => {
     watcher.start(ctx);
     await new Promise((resolve) => setTimeout(resolve, 200));
-    expect(events).toHaveLength(0);
+    const seedCount = events.length;
 
     appendFileSync(sessionFile,
       JSON.stringify({
@@ -111,12 +116,14 @@ describe("PiAgentWatcher", () => {
 
     await new Promise((resolve) => setTimeout(resolve, 2500));
 
-    expect(events.length).toBeGreaterThanOrEqual(1);
-    expect(events[0]!.agent).toBe("pi");
-    expect(events[0]!.session).toBe("myapp-session");
-    expect(events[0]!.status).toBe("done");
-    expect(events[0]!.threadId).toBe("12345678-1234-1234-1234-123456789abc");
-    expect(events[0]!.threadName).toBe("Fix the watcher status mapping");
+    const postSeed = events.slice(seedCount);
+    expect(postSeed.length).toBeGreaterThanOrEqual(1);
+    const last = postSeed[postSeed.length - 1]!;
+    expect(last.agent).toBe("pi");
+    expect(last.session).toBe("myapp-session");
+    expect(last.status).toBe("done");
+    expect(last.threadId).toBe("12345678-1234-1234-1234-123456789abc");
+    expect(last.threadName).toBe("Fix the watcher status mapping");
   });
 
   test("emits running for a newly created active Pi session", async () => {
